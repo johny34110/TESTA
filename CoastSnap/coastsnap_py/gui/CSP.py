@@ -20,6 +20,7 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import numpy as np
 import cv2
+import traceback
 
 # Import tools from our package
 from ..tools import file_utils, paths, transect_utils, tide_utils
@@ -80,9 +81,14 @@ class CoastSnapGUI:
         # Bind events for collecting points
         self.oblq_canvas.bind("<Button-1>", self._on_oblq_click)
         self.plan_canvas.bind("<Button-1>", self._on_plan_click)
+        self.oblq_canvas.bind("<Motion>", self._on_oblq_motion)
+        self.plan_canvas.bind("<Motion>", lambda e: setattr(self, "_last_hover", "plan"))
         # Bind drag events on the plan canvas for editing shoreline points
         self.plan_canvas.bind("<B1-Motion>", self._on_plan_motion)
         self.plan_canvas.bind("<ButtonRelease-1>", self._on_plan_release)
+        # Mouse wheel zoom on the oblique image and spacebar to drop a GCP
+        self.oblq_canvas.bind("<MouseWheel>", self._on_oblq_zoom)
+        master.bind("<space>", self._on_space_press)
 
         # Internal state
         self.oblq_image: Image.Image | None = None  # PIL image (RGB)
@@ -111,6 +117,13 @@ class CoastSnapGUI:
         self.selecting_roi: bool = False
         self._roi_start: tuple[int, int] | None = None
         self._roi_rect_id: int | None = None
+
+        # Zoom/pan state for the oblique canvas
+        self.oblq_zoom: float = 1.0
+        self.oblq_pan: list[float] = [0.0, 0.0]  # [x, y] offsets in canvas pixels
+        self.oblq_base_size: tuple[int, int] = (0, 0)
+        self._last_mouse_pos: tuple[int, int] | None = None
+        self._last_hover: str | None = None
 
         # Homography matrix computed during rectification (3x3).  None until image is rectified.
         self.homography: np.ndarray | None = None
@@ -287,19 +300,25 @@ class CoastSnapGUI:
         if self.oblq_image is None:
             self.oblq_canvas.delete("all")
             return
-        canvas_w = int(self.oblq_canvas.winfo_width()) or 500
-        canvas_h = int(self.oblq_canvas.winfo_height()) or 400
-        img = self.oblq_image.copy()
-        # Use a resampling filter compatible with Pillow ≥10.0
-        if hasattr(Image, "Resampling"):
-            resample = Image.Resampling.LANCZOS
-        else:
-            resample = Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.NEAREST
-        img.thumbnail((canvas_w, canvas_h), resample)
-        self.oblq_display_size = img.size
+        canvas_w, canvas_h, base_w, base_h, disp_w, disp_h = self._compute_oblq_sizes()
+        self.oblq_base_size = (base_w, base_h)
+        resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else (Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.NEAREST)
+        img = self.oblq_image.resize((disp_w, disp_h), resample)
+        self.oblq_display_size = (disp_w, disp_h)
+        # Clamp pan so the image does not slide fully out of view
+        max_dx = max(0.0, (disp_w - canvas_w) / 2.0)
+        max_dy = max(0.0, (disp_h - canvas_h) / 2.0)
+        pan_x = min(max(self.oblq_pan[0], -max_dx), max_dx)
+        pan_y = min(max(self.oblq_pan[1], -max_dy), max_dy)
+        self.oblq_pan = [pan_x, pan_y]
         self.oblq_photo = ImageTk.PhotoImage(img)
         self.oblq_canvas.delete("all")
-        self.oblq_canvas.create_image(canvas_w // 2, canvas_h // 2, image=self.oblq_photo, anchor=tk.CENTER)
+        self.oblq_canvas.create_image(
+            canvas_w // 2 + int(pan_x),
+            canvas_h // 2 + int(pan_y),
+            image=self.oblq_photo,
+            anchor=tk.CENTER,
+        )
         # Draw any existing GCP markers
         for pt in self.src_points:
             self._draw_circle(self.oblq_canvas, pt[0], pt[1], radius=4, color="red", display_scale=True, is_plan=False)
@@ -419,6 +438,129 @@ class CoastSnapGUI:
                 cx1_t = x0_canvas + (x1_t / orig_w) * disp_w
                 cy1_t = y0_canvas + (y1_t / orig_h) * disp_h
                 self.plan_canvas.create_line(cx0_t, cy0_t, cx1_t, cy1_t, fill="magenta", width=2, dash=(4, 2))
+
+    # ------------------------------------------------------------------
+    # Oblique canvas helpers (zoom, pan, coordinate transforms)
+    def _compute_oblq_sizes(self) -> tuple[int, int, int, int, int, int]:
+        """Return canvas dims, fitted base size, and zoomed display size."""
+        canvas_w = int(self.oblq_canvas.winfo_width()) or 500
+        canvas_h = int(self.oblq_canvas.winfo_height()) or 400
+        if self.oblq_image is None:
+            return canvas_w, canvas_h, 1, 1, 1, 1
+        orig_w, orig_h = self.oblq_image.size
+        scale = min(canvas_w / max(orig_w, 1), canvas_h / max(orig_h, 1))
+        if scale <= 0:
+            scale = 1.0
+        base_w = max(1, int(orig_w * scale))
+        base_h = max(1, int(orig_h * scale))
+        disp_w = max(1, int(base_w * self.oblq_zoom))
+        disp_h = max(1, int(base_h * self.oblq_zoom))
+        return canvas_w, canvas_h, base_w, base_h, disp_w, disp_h
+
+    def _canvas_to_image_oblq(self, canvas_x: float, canvas_y: float, clamp: bool = True) -> Tuple[int, int] | None:
+        """Map canvas coords to original image pixel coords on the oblique canvas."""
+        if self.oblq_image is None:
+            return None
+        canvas_w, canvas_h, _, _, disp_w, disp_h = self._compute_oblq_sizes()
+        pan_x, pan_y = self.oblq_pan
+        x0 = (canvas_w - disp_w) / 2 + pan_x
+        y0 = (canvas_h - disp_h) / 2 + pan_y
+        x_rel = (canvas_x - x0) / disp_w
+        y_rel = (canvas_y - y0) / disp_h
+        if clamp:
+            x_rel = min(max(x_rel, 0.0), 1.0)
+            y_rel = min(max(y_rel, 0.0), 1.0)
+        elif x_rel < 0.0 or x_rel > 1.0 or y_rel < 0.0 or y_rel > 1.0:
+            return None
+        orig_w, orig_h = self.oblq_image.size
+        img_x = int(x_rel * orig_w)
+        img_y = int(y_rel * orig_h)
+        return img_x, img_y
+
+    def _image_to_canvas_oblq(self, img_x: float, img_y: float) -> Tuple[float, float] | None:
+        """Map original image coords to canvas coords on the oblique canvas."""
+        if self.oblq_image is None:
+            return None
+        canvas_w, canvas_h, _, _, disp_w, disp_h = self._compute_oblq_sizes()
+        pan_x, pan_y = self.oblq_pan
+        x0 = (canvas_w - disp_w) / 2 + pan_x
+        y0 = (canvas_h - disp_h) / 2 + pan_y
+        orig_w, orig_h = self.oblq_image.size
+        canvas_x = x0 + (img_x / orig_w) * disp_w
+        canvas_y = y0 + (img_y / orig_h) * disp_h
+        return canvas_x, canvas_y
+
+    def _recenter_on_image_point(self, img_x: float, img_y: float, canvas_x: float, canvas_y: float) -> None:
+        """Adjust pan so that img point stays under the given canvas position after zoom."""
+        if self.oblq_image is None:
+            return
+        canvas_w, canvas_h, _, _, disp_w, disp_h = self._compute_oblq_sizes()
+        x0 = canvas_x - (img_x / self.oblq_image.size[0]) * disp_w
+        y0 = canvas_y - (img_y / self.oblq_image.size[1]) * disp_h
+        pan_x = x0 - (canvas_w - disp_w) / 2.0
+        pan_y = y0 - (canvas_h - disp_h) / 2.0
+        max_dx = max(0.0, (disp_w - canvas_w) / 2.0)
+        max_dy = max(0.0, (disp_h - canvas_h) / 2.0)
+        self.oblq_pan = [
+            min(max(pan_x, -max_dx), max_dx),
+            min(max(pan_y, -max_dy), max_dy),
+        ]
+
+    def _add_gcp_from_canvas(self, canvas_x: float, canvas_y: float) -> None:
+        """Record a GCP using canvas coordinates (mouse click or spacebar)."""
+        if self.oblq_image is None or self.oblq_cv is None:
+            return
+        coords = self._canvas_to_image_oblq(canvas_x, canvas_y, clamp=True)
+        if coords is None:
+            return
+        img_x, img_y = coords
+        self.src_points.append((img_x, img_y))
+        # Draw the point where it actually lands after clamping
+        canvas_pt = self._image_to_canvas_oblq(img_x, img_y)
+        if canvas_pt is not None:
+            self._draw_circle(self.oblq_canvas, canvas_pt[0], canvas_pt[1], radius=4, color="red", display_scale=False, is_plan=False)
+        # After collecting a point, update the info label to show next GCP name
+        self._update_next_gcp_info()
+        # Proceed to rectification once we have at least 3 GCPs (MATLAB parity).
+        if len(self.src_points) >= 3:
+            self.collecting_gcp = False
+            # Restore the base info (remove "Next GCP" label) prior to rectification
+            self.info_var.set(self.base_info)
+            self.compute_rectification()
+
+    def _on_oblq_motion(self, event: tk.Event) -> None:
+        """Track mouse position over the oblique canvas for spacebar placement."""
+        self._last_mouse_pos = (event.x, event.y)
+        self._last_hover = "oblq"
+
+    def _on_space_press(self, event: tk.Event) -> None:
+        """Allow placing a GCP with the spacebar at the current mouse position."""
+        if not self.collecting_gcp:
+            return
+        if self._last_hover != "oblq":
+            return
+        canvas_w = int(self.oblq_canvas.winfo_width()) or 500
+        canvas_h = int(self.oblq_canvas.winfo_height()) or 400
+        cx, cy = self._last_mouse_pos if self._last_mouse_pos is not None else (canvas_w // 2, canvas_h // 2)
+        self._add_gcp_from_canvas(cx, cy)
+
+    def _on_oblq_zoom(self, event: tk.Event) -> None:
+        """Zoom the oblique image with the mouse wheel, keeping the cursor position fixed."""
+        if self.oblq_image is None:
+            return
+        self._last_hover = "oblq"
+        self._last_mouse_pos = (event.x, event.y)
+        # Determine zoom direction
+        factor = 1.1 if event.delta > 0 else 0.9
+        new_zoom = min(max(self.oblq_zoom * factor, 0.2), 8.0)
+        if abs(new_zoom - self.oblq_zoom) < 1e-4:
+            return
+        # Compute image coordinates under the cursor before changing zoom
+        img_coords = self._canvas_to_image_oblq(event.x, event.y, clamp=False)
+        self.oblq_zoom = new_zoom
+        if img_coords is not None:
+            self._recenter_on_image_point(img_coords[0], img_coords[1], event.x, event.y)
+        self.display_oblique()
 
     # ------------------------------------------------------------------
     # Button callbacks
@@ -964,6 +1106,11 @@ class CoastSnapGUI:
         # Reset editing state
         self.selected_point_index = None
         self.dragging = False
+        # Reset zoom/pan and hover state
+        self.oblq_zoom = 1.0
+        self.oblq_pan = [0.0, 0.0]
+        self._last_mouse_pos = None
+        self._last_hover = None
         # Reset ROI selection state
         self.roi = None
         self.selecting_roi = False
@@ -1078,39 +1225,8 @@ class CoastSnapGUI:
     # ------------------------------------------------------------------
     # Event handlers
     def _on_oblq_click(self, event: tk.Event) -> None:
-        """Handle clicks on the oblique image canvas during GCP selection."""
-        if not self.collecting_gcp:
-            return
-        # Convert click position into coordinates on the original image
-        if self.oblq_image is None or self.oblq_cv is None:
-            return
-        # Determine displayed image dimensions
-        disp_w, disp_h = self.oblq_display_size
-        orig_w, orig_h = self.oblq_image.size
-        canvas_w = int(self.oblq_canvas.winfo_width()) or disp_w
-        canvas_h = int(self.oblq_canvas.winfo_height()) or disp_h
-        # Compute offset of the image in canvas (centred)
-        x0 = (canvas_w - disp_w) / 2
-        y0 = (canvas_h - disp_h) / 2
-        # Normalised coordinates relative to displayed image
-        x_rel = (event.x - x0) / disp_w
-        y_rel = (event.y - y0) / disp_h
-        x_rel = min(max(x_rel, 0.0), 1.0)
-        y_rel = min(max(y_rel, 0.0), 1.0)
-        # Convert to original image coordinates
-        img_x = int(x_rel * orig_w)
-        img_y = int(y_rel * orig_h)
-        self.src_points.append((img_x, img_y))
-        # Draw the point on the canvas
-        self._draw_circle(self.oblq_canvas, event.x, event.y, radius=4, color="red", display_scale=False, is_plan=False)
-        # After collecting a point, update the info label to show next GCP name
-        self._update_next_gcp_info()
-        # If we have collected the expected number of GCPs, proceed to rectification
-        if self.expected_gcp_count > 0 and len(self.src_points) >= self.expected_gcp_count:
-            self.collecting_gcp = False
-            # Restore the base info (remove "Next GCP" label) prior to rectification
-            self.info_var.set(self.base_info)
-            self.compute_rectification()
+        """Mouse clicks on oblique canvas are disabled; use spacebar instead."""
+        return
 
     def _on_plan_click(self, event: tk.Event) -> None:
         """Handle clicks on the plan image canvas during shoreline digitisation."""
@@ -1210,16 +1326,29 @@ class CoastSnapGUI:
 
         Fallback: simple homography.
         """
+        print(f"[DEBUG] compute_rectification called with {len(self.src_points)} GCPs")
         # MATLAB-style can be attempted with >=3 (ambiguous) but is reliable with >=4.
         if len(self.src_points) < 3:
+            messagebox.showwarning("Not enough GCPs", "Place au moins 3 points pour lancer la rectification.")
             return
         if self.oblq_cv is None:
             return
         # Convert source points to numpy array
         src_pts = np.array(self.src_points[: len(self.src_points)], dtype=np.float32)
+        # Helper for tolerant key lookup on GCP dicts (handles easting/eastings, etc.)
+        def _g(v: dict, *keys: str) -> float:
+            for k in keys:
+                if k in v and v[k] is not None:
+                    try:
+                        return float(v[k])
+                    except Exception:
+                        continue
+            raise KeyError(keys[0])
         # Determine destination image and homography using site metadata or fallback
         site_info = self.current_site_info if self.current_site_info else None
         gcp_world_list = self.gcp_world_points if self.gcp_world_points else None
+        print("[DEBUG] site_info keys:", list(site_info.keys()) if isinstance(site_info, dict) else None)
+        print("[DEBUG] gcp_world_list len:", len(gcp_world_list) if gcp_world_list else 0)
         dest_pts = None
         out_width: int | None = None
         out_height: int | None = None
@@ -1245,8 +1374,8 @@ class CoastSnapGUI:
                 # MATLAB-style xyz: x/y local (metres), z absolute datum
                 xyz_list = []
                 for g in gcp_world_list:
-                    east = float(g.get('eastings'))
-                    north = float(g.get('northings'))
+                    east = _g(g, 'eastings', 'easting')
+                    north = _g(g, 'northings', 'northing')
                     elev = float(g.get('elevation', 0.0))
                     xyz_list.append([east - origin_east, north - origin_north, elev])
                 xyz = np.array(xyz_list, dtype=float)
@@ -1327,11 +1456,14 @@ class CoastSnapGUI:
                 self.display_plan()
                 return
             except Exception:
+                print("[DEBUG] Camera-model rectification failed, falling back to homography/affine")
+                print(traceback.format_exc())
                 # If calibration fails, fall back to homography method
                 pass
 
-        # Homography fallback needs at least 4 points
-        if len(self.src_points) < 4:
+        # Homography/affine fallback needs at least 3 points
+        if len(self.src_points) < 3:
+            print("[DEBUG] Fallback skipped: fewer than 3 points")
             return
         # If advanced calibration not performed, fallback to simpler homography method
         # Determine destination points and output size based on site metadata as before
@@ -1359,8 +1491,8 @@ class CoastSnapGUI:
                 out_height = int(round((ylim_upper - ylim_lower) / res))
                 dest_list: list[list[float]] = []
                 for gcp in gcp_world:
-                    east = float(gcp.get('eastings'))
-                    north = float(gcp.get('northings'))
+                    east = _g(gcp, 'eastings', 'easting')
+                    north = _g(gcp, 'northings', 'northing')
                     x_rel = east - origin_east
                     y_rel = north - origin_north
                     dest_x = (x_rel - xlim_left) / res
@@ -1369,7 +1501,8 @@ class CoastSnapGUI:
                 dest_pts = np.array(dest_list[: len(src_pts)], dtype=np.float32)
             except Exception:
                 dest_pts = None
-        if dest_pts is None or len(dest_pts) < 4:
+        print("[DEBUG] dest_pts before fallback:", None if dest_pts is None else dest_pts.shape)
+        if dest_pts is None or len(dest_pts) < 3:
             out_width = 800
             out_height = 800
             dest_pts = np.array(
@@ -1387,8 +1520,8 @@ class CoastSnapGUI:
                 x_coords = []
                 y_coords = []
                 for g in gcp_world:
-                    east = float(g.get('eastings'))
-                    north = float(g.get('northings'))
+                    east = _g(g, 'eastings', 'easting')
+                    north = _g(g, 'northings', 'northing')
                     x_rel = (east - origin_east) / res
                     y_rel = (north - origin_north) / res
                     x_coords.append(x_rel)
@@ -1403,15 +1536,17 @@ class CoastSnapGUI:
                     out_width = out_height = 800
                 dest_pts_list = []
                 for g in gcp_world[: len(src_pts)]:
-                    east = float(g.get('eastings'))
-                    north = float(g.get('northings'))
+                    east = _g(g, 'eastings', 'easting')
+                    north = _g(g, 'northings', 'northing')
                     x_rel = (east - origin_east) / res
                     y_rel = (north - origin_north) / res
                     dest_x = x_rel - x_min
                     dest_y = (y_max - y_rel)
                     dest_pts_list.append([dest_x, dest_y])
                 dest_pts = np.array(dest_pts_list, dtype=np.float32)
-            except Exception:
+            except Exception as e:
+                print("[DEBUG] need_bbox fallback failed", e)
+                print(traceback.format_exc())
                 out_width = 800
                 out_height = 800
                 dest_pts = np.array(
@@ -1419,15 +1554,46 @@ class CoastSnapGUI:
                 )
         # Compute homography using simple method
         pair_count = min(len(src_pts), len(dest_pts))
-        H, mask = cv2.findHomography(src_pts[:pair_count], dest_pts[:pair_count])
-        if H is None:
-            messagebox.showerror("Error", "Failed to compute homography.")
+        print(f"[DEBUG] pair_count={pair_count}, src_pts shape={src_pts.shape}, dest_pts shape={dest_pts.shape}, out_size={(out_width, out_height)}")
+        if pair_count < 3:
+            messagebox.showerror("Error", "At least 3 GCPs are required for rectification.")
             return
-        self.homography = H
-        if out_width is None or out_height is None:
-            out_width = 800
-            out_height = 800
-        rectified_cv = cv2.warpPerspective(self.oblq_cv, H, (int(out_width), int(out_height)))
+        if pair_count == 3:
+            # Affine transform using 3-point mapping
+            try:
+                M = cv2.getAffineTransform(
+                    src_pts[:3].astype(np.float32),
+                    dest_pts[:3].astype(np.float32),
+                )
+                if out_width is None or out_height is None:
+                    out_width = 800
+                    out_height = 800
+                rectified_cv = cv2.warpAffine(self.oblq_cv, M, (int(out_width), int(out_height)))
+                # Store as 3x3 for consistency in downstream usage
+                self.homography = np.vstack([M, [0.0, 0.0, 1.0]])
+                print("[DEBUG] Applied affine rectification (3-point)")
+            except Exception as e:
+                print("[DEBUG] Affine rectification failed", e)
+                print(traceback.format_exc())
+                messagebox.showerror("Error", f"Affine rectification failed: {e}")
+                return
+        else:
+            try:
+                H, mask = cv2.findHomography(src_pts[:pair_count], dest_pts[:pair_count])
+                if H is None:
+                    messagebox.showerror("Error", "Failed to compute homography.")
+                    return
+                self.homography = H
+                if out_width is None or out_height is None:
+                    out_width = 800
+                    out_height = 800
+                rectified_cv = cv2.warpPerspective(self.oblq_cv, H, (int(out_width), int(out_height)))
+                print("[DEBUG] Applied homography rectification (>=4 points)")
+            except Exception as e:
+                print("[DEBUG] Homography rectification failed", e)
+                print(traceback.format_exc())
+                messagebox.showerror("Error", f"Homography rectification failed: {e}")
+                return
         self.plan_cv = rectified_cv
         rect_rgb = cv2.cvtColor(rectified_cv, cv2.COLOR_BGR2RGB)
         self.plan_image = Image.fromarray(rect_rgb)
@@ -1523,8 +1689,9 @@ class CoastSnapGUI:
                 orig_w, orig_h = self.oblq_image.size
                 canvas_w = int(self.oblq_canvas.winfo_width()) or disp_w
                 canvas_h = int(self.oblq_canvas.winfo_height()) or disp_h
-                x0 = (canvas_w - disp_w) / 2
-                y0 = (canvas_h - disp_h) / 2
+                pan_x, pan_y = self.oblq_pan
+                x0 = (canvas_w - disp_w) / 2 + pan_x
+                y0 = (canvas_h - disp_h) / 2 + pan_y
                 x_rel = x / orig_w
                 y_rel = y / orig_h
                 canvas_x = x0 + x_rel * disp_w
